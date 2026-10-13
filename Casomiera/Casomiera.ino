@@ -80,6 +80,9 @@
  *      52 57 3A 01 02 00 00  7A 30 00 82  46 32 00 82  00 00 00 00  00 00 00 00
  *      00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00  0D
  *    Resetnutá: stopky čas 0; odpočet T1 = nastavený čas (240000 ms = 4:00), stav 0x00
+ *  UDALOSTI (USB, RS232, HC-12, UDP – raz, hneď za rámcom s novým stavom, ukončené CR):
+ *    "START"  – štart fotobunkou (stopky aj odpočet)
+ *    "STOP"   – zastavili všetky potrebné časy (LP+PP / LP / koniec odpočtu / ručne RESETOM)
  *  PRÍKAZY (USB, RS232 aj HC-12, ukončené CR): "RW:RST" = RESET, "RW:CHNG" = CHANGE
  *  USB: 115200 baud. Ladiace texty na USB sú vypnuté (usb_debug=1 ich zapne,
  *       ale vtedy sa na USB neposielajú rámce).
@@ -264,6 +267,9 @@ char      txBuf[96];              // binárny rámec RW: (RS232, HC-12, UDP)
 size_t    txLen   = 0;
 char      txText[96];             // textová správa (UDP, ak udp_text=1)
 size_t    txTextLen = 0;
+char      evText[12] = "";        // udalosť "START" / "STOP" – pošle sa raz, hneď po rámci
+uint32_t  evSeq = 0;              // zvýši sa pri každej novej udalosti
+char      evPending[12] = "";     // loop: čaká na odoslanie spolu s najbližším rámcom
 uint32_t  txEvent = 0;            // zvýši sa pri štarte / zostrelení / stope -> okamžité odoslanie
 #define   MAX_CLIENTS 8
 IPAddress clientIP[MAX_CLIENTS];  // pripojené zariadenia (mobil, LED displej...)
@@ -455,6 +461,14 @@ void manualStop() {
   char a[16];
   fmtCs(a, sizeof a, usToCs(tStop - gTStart));
   Dbg.printf("[STOP RUCNE] %s s%s%s\n", a, manLP ? " LP" : "", manPP ? " PP" : "");
+  postEvent("STOP");
+}
+
+// udalosť START / STOP – odošle sa na všetky výstupy hneď po rámci s novým stavom
+void postEvent(const char *t) {
+  strncpy(evPending, t, sizeof(evPending) - 1);
+  evPending[sizeof(evPending) - 1] = 0;
+  forceSend = true;
 }
 
 // zobrazovaný kanál: ak ho nevybral CHANGE, vždy ten s väčším časom
@@ -476,7 +490,7 @@ void processRun() {
     forceSend = true;
     Times t = getTimes();
     char a[16];
-    if (ev & EV_START) Dbg.println(F("[START]"));
+    if (ev & EV_START) { Dbg.println(F("[START]")); postEvent("START"); }
     if (ev & EV_LP) { fmtCs(a, sizeof a, t.lpCs); Dbg.printf("[LP] %s s\n", a); }
     if (ev & EV_PP) { fmtCs(a, sizeof a, t.ppCs); Dbg.printf("[PP] %s s\n", a); }
   }
@@ -512,6 +526,7 @@ void processRun() {
     char a[16];
     fmtCs(a, sizeof a, usToCs(tStop - s.ts));
     Dbg.printf("[STOP] %s s\n", a);
+    postEvent("STOP");
   }
 }
 
@@ -743,7 +758,8 @@ void publishMsg() {
   last = now;
 
   uint8_t fr[FR_LEN];
-  if (!buildFrame(fr)) return;   // rámec s 0x0D v dátach počas behu – vynechať
+  if (!buildFrame(fr) && !evPending[0]) return;   // rámec s 0x0D počas behu – vynechať
+  // (pri udalosti START/STOP sa rámec pošle vždy, nech prijímač dostane nový stav)
   char txt[96];
   size_t tlen = cfg.udpText ? buildMsg(txt, sizeof txt) : 0;
 
@@ -753,7 +769,12 @@ void publishMsg() {
   memcpy(txText, txt, tlen);
   txTextLen = tlen;
   if (forceSend) txEvent++;
+  if (evPending[0]) {                    // udalosť ide spolu s rámcom, ktorý ju obsahuje
+    memcpy(evText, evPending, sizeof(evText));
+    evSeq++;
+  }
   portEXIT_CRITICAL(&txMux);
+  evPending[0] = 0;
   forceSend = false;
 }
 
@@ -799,12 +820,15 @@ void sendUDP(const char *msg, size_t len) {
 // ÚLOHA ODOSIELANIA (jadro 0) – UDP mobil, UDP LED displej, RS232, HC-12
 void commTask(void *) {
   uint32_t lastNet = 0, lastSer = 0, lastCli = 0;
-  uint32_t evNet = 0, evSer = 0;
+  uint32_t evNet = 0, evSer = 0, evLast = 0;
   char msg[96], txt[96];
   for (;;) {
     size_t len, tlen;
-    uint32_t ev;
+    uint32_t ev, es;
+    char evt[12];
     portENTER_CRITICAL(&txMux);
+    es = evSeq;
+    memcpy(evt, evText, sizeof(evt));
     len = txLen;
     memcpy(msg, txBuf, len);
     tlen = txTextLen;
@@ -835,6 +859,18 @@ void commTask(void *) {
         if (cfg.useRS232) Serial2.write((const uint8_t *)msg, len);
         if (cfg.useHC12)  Serial1.write((const uint8_t *)msg, len);
         if (cfg.useUSB && !cfg.usbDebug) Serial.write((const uint8_t *)msg, len);
+      }
+
+      // START / STOP – raz, hneď za rámcom s novým stavom, na všetky výstupy.
+      // Ukončené len CR (ako rámec); PC program riadok bez "RW:" na začiatku ignoruje.
+      if (es != evLast) {
+        evLast = es;
+        char line[16];
+        int n = snprintf(line, sizeof line, "%s\r", evt);
+        sendUDP(line, n);
+        if (cfg.useRS232) Serial2.write((const uint8_t *)line, n);
+        if (cfg.useHC12)  Serial1.write((const uint8_t *)line, n);
+        if (cfg.useUSB && !cfg.usbDebug) Serial.write((const uint8_t *)line, n);
       }
     }
     vTaskDelay(pdMS_TO_TICKS(5));
@@ -1203,7 +1239,7 @@ void setup() {
   lcd->backlight();
   lcd->clear();
   for (uint8_t r = 0; r < 4; r++) { memset(lcdCache[r], ' ', 20); lcdCache[r][20] = 0; }
-  lcdMsg("CASOMIERA v1.1", cfgSource == 1 ? "Nastavenia: SD" :
+  lcdMsg("CASOMIERA v1.2", cfgSource == 1 ? "Nastavenia: SD" :
                            cfgSource == 2 ? "Nastavenia: EEPROM" : "Nastavenia: predvol.");
 
   // sériové linky
